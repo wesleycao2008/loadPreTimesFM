@@ -1,0 +1,8 @@
+{
+    "python.defaultInterpreterPath": "D:\\ProgramData\\Anaconda3\\envs\\py311\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "python.analysis.typeCheckingMode": "basic",
+    "files.associations": {
+        "*.py": "python"
+    }
+}
