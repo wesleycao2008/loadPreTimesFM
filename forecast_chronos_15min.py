@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 使用 Amazon Chronos-2 对 15 分钟级负荷数据进行零样本预测，并将结果写入达梦数据库。
-- 输入：data/dm_output.xlsx（15 分钟一条记录）
+- 输入：直接从达梦数据库读取 MEA 发电数据、NWP 温度/辐照数据（15 分钟一条记录）
 - 协变量：TEMPERATURE、RADI
 - 目标变量：y
 - 预测：未来 10 天，每 15 分钟一条记录（共 960 条）
@@ -12,6 +12,8 @@
 新增滚动预测：
 - 通过 --start-date 和 --end-date 指定起止日期，系统按天为单位执行滚动预测。
 - 每个日期预测未来 10 天；输出文件按日期后缀命名。
+- 每次预测只从数据库读取该次所需的输入时间窗口，不一次性加载全量数据。
+- MEA 发电数据与 NWP 气象数据可分别配置 ID。
 
 输出控制：
 - 默认写入达梦数据库，不生成 CSV/PNG 文件。
@@ -27,7 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # 国内访问 HuggingFace 较慢，优先使用镜像端点
@@ -58,7 +60,6 @@ HORIZON_DAYS = 10
 STEPS_PER_DAY = 24 * 4              # 15 分钟一条记录，一天 96 条
 HORIZON_STEPS = HORIZON_DAYS * STEPS_PER_DAY
 FREQ = "15min"                      # 数据频率
-SPLIT_DATE = pd.Timestamp("2025-12-22")
 
 # 达梦数据库表列定义
 V_COLUMNS = [f"V{h:02d}{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
@@ -87,6 +88,173 @@ def _resample_to_15min(
             df_in[col] = df_in[col].interpolate(method="linear", limit_direction="both")
     df_in[TIMESTAMP_COLUMN] = df_in.index
     return df_in.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 数据库按需读取
+# ---------------------------------------------------------------------------
+def _yearly_table(schema: str, base_table: str, year: int) -> str:
+    """
+    根据 schema、表名前缀和年份生成完整表名。
+    格式："SCHEMA"."TABLE_YYYY"
+    """
+    return f'"{schema}"."{base_table}_{year}"'
+
+
+def _read_mea_range(
+    conn, start: pd.Timestamp, end: pd.Timestamp, args: argparse.Namespace
+) -> pd.DataFrame:
+    """
+    从 MEA 表按时间窗口读取发电数据；若窗口跨年，则分别查询对应年份的表。
+    表中每行 1 小时（V00/V15/V30/V45），展开为 15 分钟一行。
+    """
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    years = list(range(start_ts.year, end_ts.year + 1))
+
+    all_records = []
+    for year in years:
+        table = _yearly_table(args.db_user, args.db_mea_table, year)
+        year_start = max(start_ts, pd.Timestamp(f"{year}-01-01"))
+        year_end = min(end_ts, pd.Timestamp(f"{year}-12-31 23:59:59"))
+
+        cursor = conn.cursor()
+        start_hour = year_start.floor("h")
+        end_hour = year_end.floor("h")
+        sql = (
+            "SELECT DATA_TIME, V00, V15, V30, V45 "
+            f"FROM {table} "
+            "WHERE ID=? AND MEAS_TYPE=? AND DATA_TIME>=? AND DATA_TIME<=? "
+            "ORDER BY DATA_TIME"
+        )
+        cursor.execute(sql, (args.db_id, args.db_mea_meas_type, start_hour, end_hour))
+        rows = cursor.fetchall()
+        cursor.close()
+
+        for row in rows:
+            base_time = row[0]
+            for minute_offset, val in zip([0, 15, 30, 45], row[1:]):
+                if val is not None:
+                    ds = base_time + timedelta(minutes=minute_offset)
+                    if start <= ds <= end:
+                        all_records.append({TIMESTAMP_COLUMN: ds, TARGET_VAR: float(val)})
+
+    df = pd.DataFrame(all_records)
+    if not df.empty:
+        df.sort_values(TIMESTAMP_COLUMN, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def _read_nwp_range(
+    conn,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    meas_type: str,
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    """
+    从 NWP 表按时间窗口读取温度或辐照数据；若窗口跨年，则分别查询对应年份的表。
+    表中每行 1 天（V0000~V2300，每小时 1 个点），线性插值为 15 分钟一行。
+    """
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    years = list(range(start_ts.year, end_ts.year + 1))
+
+    all_hourly_records = []
+    for year in years:
+        table = _yearly_table(args.db_user, args.db_nwp_table, year)
+        year_start = max(start_ts, pd.Timestamp(f"{year}-01-01"))
+        year_end = min(end_ts, pd.Timestamp(f"{year}-12-31 23:59:59"))
+
+        cursor = conn.cursor()
+        hourly_cols = ", ".join([f"V{i:02d}00" for i in range(24)])
+        start_day = year_start.floor("D")
+        end_day = year_end.floor("D")
+        sql = (
+            f"SELECT YB_TIME, {hourly_cols} "
+            f"FROM {table} "
+            "WHERE ID=? AND MEAS_TYPE=? AND YB_TIME=FB_TIME+1 "
+            "AND YB_TIME>=? AND YB_TIME<=? "
+            "ORDER BY YB_TIME"
+        )
+        cursor.execute(sql, (args.db_id_nwp, meas_type, start_day, end_day))
+        rows = cursor.fetchall()
+        cursor.close()
+
+        for row in rows:
+            base_date = row[0]
+            for hour in range(24):
+                val = row[1 + hour]
+                if val is not None:
+                    ts = base_date + timedelta(hours=hour)
+                    all_hourly_records.append({TIMESTAMP_COLUMN: ts, "value": float(val)})
+
+    hourly_df = pd.DataFrame(all_hourly_records)
+    if hourly_df.empty:
+        return pd.DataFrame(columns=[TIMESTAMP_COLUMN, "value"])
+
+    hourly_df.set_index(TIMESTAMP_COLUMN, inplace=True)
+    hourly_df.sort_index(inplace=True)
+
+    start_time = pd.Timestamp(start).floor("15min")
+    end_time = pd.Timestamp(end).floor("15min")
+    target_index = pd.date_range(start=start_time, end=end_time, freq=FREQ)
+
+    target_df = (
+        hourly_df.reindex(hourly_df.index.union(target_index))
+        .sort_index()
+        .interpolate(method="linear")
+    )
+    target_df = target_df.loc[target_index].reset_index().rename(
+        columns={"index": TIMESTAMP_COLUMN, "value": "value"}
+    )
+    return target_df
+
+
+def _load_forecast_data(
+    conn, split_date: pd.Timestamp, args: argparse.Namespace
+) -> pd.DataFrame | None:
+    """
+    为单次预测从数据库读取所需时间窗口的数据：
+    - 上下文：split_date 前 max_context_days 天
+    - 预测期：split_date 起未来 HORIZON_DAYS 天
+    """
+    horizon_end = split_date + pd.Timedelta(days=HORIZON_DAYS)
+    context_start = split_date - pd.Timedelta(days=args.max_context_days)
+
+    print(f"       数据库读取窗口: {context_start} ~ {horizon_end}")
+
+    df_mea = _read_mea_range(conn, context_start, horizon_end, args)
+    if df_mea.empty:
+        print(f"[错误] {split_date.strftime('%Y-%m-%d')} 在数据库中未读取到 MEA 发电数据。")
+        return None
+
+    df_temp = _read_nwp_range(conn, context_start, horizon_end, args.db_nwp_temp_meas_type, args)
+    df_temp.rename(columns={"value": "TEMPERATURE"}, inplace=True)
+
+    df_radi = _read_nwp_range(conn, context_start, horizon_end, args.db_nwp_radi_meas_type, args)
+    df_radi.rename(columns={"value": "RADI"}, inplace=True)
+
+    df = df_mea.merge(df_temp, on=TIMESTAMP_COLUMN, how="left")
+    df = df.merge(df_radi, on=TIMESTAMP_COLUMN, how="left")
+
+    # 删除全天 RADI 值都为 0 的记录
+    df["date"] = df[TIMESTAMP_COLUMN].dt.date
+    days_all_zero = df.groupby("date")["RADI"].transform(lambda x: (x == 0).all())
+    removed_days = df.loc[days_all_zero, "date"].unique()
+    df = df[~days_all_zero].copy()
+    df.drop(columns=["date"], inplace=True)
+    if len(removed_days):
+        print(
+            f"       移除 {len(removed_days)} 天 RADI 全为 0 的日期: "
+            f"{sorted(str(d) for d in removed_days)}"
+        )
+
+    df.sort_values(TIMESTAMP_COLUMN, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df[TIMESTAMP_COLUMN] = pd.to_datetime(df[TIMESTAMP_COLUMN])
+    return df
 
 
 def _build_db_rows(result_df: pd.DataFrame, fb_time: datetime, args: argparse.Namespace) -> list[dict]:
@@ -143,7 +311,7 @@ def _build_db_rows(result_df: pd.DataFrame, fb_time: datetime, args: argparse.Na
 
 
 def _write_to_db(rows: list[dict], args: argparse.Namespace) -> tuple[int, int]:
-    """连接达梦数据库，执行更新或插入。返回 (inserted, updated)。"""
+    """连接达梦数据库，按 YB_TIME 年份分表执行更新或插入。返回 (inserted, updated)。"""
     import dmPython
 
     conn = dmPython.connect(
@@ -158,27 +326,33 @@ def _write_to_db(rows: list[dict], args: argparse.Namespace) -> tuple[int, int]:
     try:
         set_clause = ",".join([f'"{c}"=?' for c in ALL_V_COLUMNS + ["UPDATE_TIME"]])
         where_clause = " AND ".join([f'"{c}"=?' for c in PK_COLUMNS])
-        update_sql = (
-            f"UPDATE {args.db_table} SET {set_clause} WHERE {where_clause}"
-        )
-
         insert_col_str = ",".join([f'"{c}"' for c in INSERT_COLUMNS])
         insert_placeholders = ",".join(["?"] * len(INSERT_COLUMNS))
-        insert_sql = f"INSERT INTO {args.db_table} ({insert_col_str}) VALUES ({insert_placeholders})"
+
+        # 按 YB_TIME 年份分表
+        rows_by_year: dict[int, list[dict]] = {}
+        for row in rows:
+            year = row["YB_TIME"].year
+            rows_by_year.setdefault(year, []).append(row)
 
         inserted = 0
         updated = 0
-        for row in rows:
-            update_params = [row[c] for c in ALL_V_COLUMNS + ["UPDATE_TIME"]] + [
-                row[c] for c in PK_COLUMNS
-            ]
-            cursor.execute(update_sql, update_params)
-            if cursor.rowcount and cursor.rowcount > 0:
-                updated += 1
-            else:
-                insert_params = [row[c] for c in INSERT_COLUMNS]
-                cursor.execute(insert_sql, insert_params)
-                inserted += 1
+        for year, year_rows in rows_by_year.items():
+            table = _yearly_table(args.db_user, args.db_table, year)
+            update_sql = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
+            insert_sql = f"INSERT INTO {table} ({insert_col_str}) VALUES ({insert_placeholders})"
+
+            for row in year_rows:
+                update_params = [row[c] for c in ALL_V_COLUMNS + ["UPDATE_TIME"]] + [
+                    row[c] for c in PK_COLUMNS
+                ]
+                cursor.execute(update_sql, update_params)
+                if cursor.rowcount and cursor.rowcount > 0:
+                    updated += 1
+                else:
+                    insert_params = [row[c] for c in INSERT_COLUMNS]
+                    cursor.execute(insert_sql, insert_params)
+                    inserted += 1
 
         conn.commit()
         return inserted, updated
@@ -204,12 +378,14 @@ def _run_single_forecast(
     file_suffix = f"_{date_suffix}" if use_date_suffix else ""
     horizon_end = split_date + pd.Timedelta(minutes=HORIZON_STEPS * 15)
 
-    if args.fb_date:
-        fb_time = pd.Timestamp(args.fb_date).to_pydatetime().replace(
+    if args.start_date and args.end_date:
+        # 滚动回测：FB_TIME 为预测起始日前一天
+        fb_time = (split_date - pd.Timedelta(days=1)).to_pydatetime().replace(
             hour=0, minute=0, second=0, microsecond=0
         )
     else:
-        fb_time = (split_date - pd.Timedelta(days=1)).to_pydatetime().replace(
+        # 单次运行：FB_TIME 由 --fb-date 指定
+        fb_time = pd.Timestamp(args.fb_date).to_pydatetime().replace(
             hour=0, minute=0, second=0, microsecond=0
         )
 
@@ -314,36 +490,52 @@ def _run_single_forecast(
 
     print(f"       预测长度: {len(pred)} 条（15 分钟/条）")
 
-    # 4) 提取实测值并计算误差指标
-    print("       与实测 y 对比...")
-    actual = horizon_df[TARGET_VAR].to_numpy(dtype=np.float32)
+    # 4) 判断是否存在预测期实测值，并决定是否计算误差指标
+    has_actual = horizon_df[TARGET_VAR].notna().any()
 
-    mae = float(np.mean(np.abs(actual - pred)))
-    rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
-    mape = float(np.mean(np.abs((actual - pred) / actual)) * 100)
-    coverage = float(
-        np.mean((actual >= lower_80) & (actual <= upper_80)) * 100
-    )
+    if has_actual:
+        print("       与实测 y 对比...")
+        actual = horizon_df[TARGET_VAR].to_numpy(dtype=np.float32)
 
-    print(f"       MAE : {mae:.3f}")
-    print(f"       RMSE: {rmse:.3f}")
-    print(f"       MAPE: {mape:.2f}%")
-    print(f"       80% PI Coverage: {coverage:.1f}%")
+        mae = float(np.mean(np.abs(actual - pred)))
+        rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
+        mape = float(np.mean(np.abs((actual - pred) / actual)) * 100)
+        coverage = float(
+            np.mean((actual >= lower_80) & (actual <= upper_80)) * 100
+        )
+
+        print(f"       MAE : {mae:.3f}")
+        print(f"       RMSE: {rmse:.3f}")
+        print(f"       MAPE: {mape:.2f}%")
+        print(f"       80% PI Coverage: {coverage:.1f}%")
+    else:
+        print("       未找到预测期实测 y，执行纯未来预测（不计算误差指标）...")
+        actual = np.full_like(pred, np.nan)
+        mae = rmse = mape = coverage = None
 
     # 5) 构造预测结果（用于入库或导出）
     print("       构造预测结果...")
     future_dt = horizon_df[TIMESTAMP_COLUMN].values
 
-    result_df = pd.DataFrame(
-        {
-            TIMESTAMP_COLUMN: future_dt,
-            "y_ACTUAL": np.round(actual, 3),
-            "y_PRED": np.round(pred, 3),
-            "y_MEAN": np.round(mean_fc, 3),
-            "y_Q10": np.round(lower_80, 3),
-            "y_Q90": np.round(upper_80, 3),
+    result_data = {
+        TIMESTAMP_COLUMN: future_dt,
+        "y_PRED": np.round(pred, 3),
+        "y_MEAN": np.round(mean_fc, 3),
+        "y_Q10": np.round(lower_80, 3),
+        "y_Q90": np.round(upper_80, 3),
+    }
+    if has_actual:
+        result_data["y_ACTUAL"] = np.round(actual, 3)
+        # 保持与原有输出顺序一致
+        result_data = {
+            TIMESTAMP_COLUMN: result_data[TIMESTAMP_COLUMN],
+            "y_ACTUAL": result_data["y_ACTUAL"],
+            "y_PRED": result_data["y_PRED"],
+            "y_MEAN": result_data["y_MEAN"],
+            "y_Q10": result_data["y_Q10"],
+            "y_Q90": result_data["y_Q90"],
         }
-    )
+    result_df = pd.DataFrame(result_data)
 
     if args.skip_db:
         # 仅生成 CSV 和图表
@@ -375,16 +567,17 @@ def _run_single_forecast(
             color="tab:orange",
             linewidth=2,
         )
-        ax.plot(
-            future_dt,
-            actual,
-            label="y 实测",
-            color="tab:green",
-            linewidth=1.5,
-            linestyle="--",
-            marker="o",
-            markersize=2,
-        )
+        if has_actual:
+            ax.plot(
+                future_dt,
+                actual,
+                label="y 实测",
+                color="tab:green",
+                linewidth=1.5,
+                linestyle="--",
+                marker="o",
+                markersize=2,
+            )
         ax.fill_between(
             future_dt,
             lower_80,
@@ -394,9 +587,13 @@ def _run_single_forecast(
             label="80% 预测区间 (q10-q90)",
         )
         ax.axvline(split_line, color="gray", linestyle="--", linewidth=1)
+        if has_actual:
+            title_metrics = f"MAE={mae:.1f}  RMSE={rmse:.1f}  MAPE={mape:.1f}%  Coverage={coverage:.1f}%"
+        else:
+            title_metrics = "无实测对比（纯未来预测）"
         ax.set_title(
             f"15 分钟级负荷 {date_str} 起未来 10 天预测（Chronos-2 + 协变量）\n"
-            f"MAE={mae:.1f}  RMSE={rmse:.1f}  MAPE={mape:.1f}%  Coverage={coverage:.1f}%"
+            f"{title_metrics}"
         )
         ax.set_xlabel("时间")
         ax.set_ylabel("负荷")
@@ -426,11 +623,6 @@ def _run_single_forecast(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Chronos-2 15 分钟级负荷预测 + 达梦入库")
     parser.add_argument(
-        "--input",
-        default="data/dm_output.xlsx",
-        help="输入 Excel 文件路径",
-    )
-    parser.add_argument(
         "--output-dir",
         default="output",
         help="输出目录",
@@ -444,11 +636,6 @@ def main() -> int:
         "--device",
         default="cuda",
         help="运行设备：cuda 或 cpu",
-    )
-    parser.add_argument(
-        "--split-date",
-        default=SPLIT_DATE.strftime("%Y-%m-%d"),
-        help="预测起始日期（含），格式 YYYY-MM-DD；未指定 --start-date/--end-date 时使用",
     )
     parser.add_argument(
         "--start-date",
@@ -495,10 +682,48 @@ def main() -> int:
         default="damengres2000",
         help="达梦数据库密码",
     )
+    # MEA 发电数据源配置
+    parser.add_argument(
+        "--db-mea-table",
+        default="RES_CON_PWRGRID_H1_MEA",
+        help="MEA 发电数据表名前缀，实际表名为 \"db_user\".\"prefix_YYYY\"",
+    )
+    parser.add_argument(
+        "--db-mea-meas-type",
+        default="10132001",
+        help="MEA 发电数据 MEAS_TYPE",
+    )
+    # NWP 气象数据源配置
+    parser.add_argument(
+        "--db-nwp-table",
+        default="RES_CON_NWP_F_FORECAST",
+        help="NWP 气象数据表名前缀，实际表名为 \"db_user\".\"prefix_YYYY\"",
+    )
+    parser.add_argument(
+        "--db-id-nwp",
+        default="0101350600",
+        help="NWP 气象数据 ID",
+    )
+    parser.add_argument(
+        "--db-nwp-temp-meas-type",
+        default="00001002",
+        help="NWP 温度数据 MEAS_TYPE",
+    )
+    parser.add_argument(
+        "--db-nwp-radi-meas-type",
+        default="40071013",
+        help="NWP 辐照数据 MEAS_TYPE",
+    )
+    parser.add_argument(
+        "--max-context-days",
+        type=int,
+        default=60,
+        help="每次预测从数据库读取的上下文历史天数",
+    )
     parser.add_argument(
         "--db-table",
-        default='"RES2000_FJ"."RES_CON_PWRGRID_F_FORECAST_2025"',
-        help="目标表名（已带 schema 引号）",
+        default="RES_CON_PWRGRID_F_FORECAST",
+        help="目标表名前缀，实际表名为 \"db_user\".\"prefix_YYYY\"",
     )
     parser.add_argument(
         "--db-id",
@@ -535,8 +760,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--fb-date",
-        default=None,
-        help="预报时间 FB_TIME，格式 YYYY-MM-DD；默认 split_date 前一天",
+        default=datetime.now().strftime("%Y-%m-%d"),
+        help="预报时间 FB_TIME，格式 YYYY-MM-DD；默认当日日期",
     )
     parser.add_argument(
         "--fill-v2400",
@@ -551,16 +776,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    input_path = Path(args.input)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not input_path.exists():
-        print(f"[错误] 找不到输入文件: {input_path.resolve()}")
-        return 1
-
     # 确定预测日期列表
     if args.start_date and args.end_date:
+        # 滚动回测：--start-date/--end-date 为预测起始日期
         start_date = pd.Timestamp(args.start_date)
         end_date = pd.Timestamp(args.end_date)
         if end_date < start_date:
@@ -571,55 +792,76 @@ def main() -> int:
         print("[错误] --start-date 和 --end-date 必须同时指定")
         return 1
     else:
-        split_dates = [pd.Timestamp(args.split_date)]
+        # 单次运行：由 FB_TIME 推导预测起始日期（split_date = fb_date + 1 天）
+        fb_date = pd.Timestamp(args.fb_date)
+        split_date = fb_date + pd.Timedelta(days=1)
+        split_dates = [split_date]
 
-    # 1) 读取数据
-    print(f"[1/4] 读取数据: {input_path}")
-    df = pd.read_excel(input_path)
-    required_cols = [TIMESTAMP_COLUMN, TARGET_VAR] + COVARIATES
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        print(f"[错误] 缺少列: {missing}")
-        return 1
-
-    df = df.sort_values(TIMESTAMP_COLUMN).reset_index(drop=True)
-    df[TIMESTAMP_COLUMN] = pd.to_datetime(df[TIMESTAMP_COLUMN])
-    print(f"       时间范围: {df[TIMESTAMP_COLUMN].min()} ~ {df[TIMESTAMP_COLUMN].max()}")
-    print(f"       总行数: {len(df)}")
-    print(f"       数据频率: 15 分钟")
     print(f"       预测日期: {', '.join([d.strftime('%Y-%m-%d') for d in split_dates])}")
 
-    # 2) 加载模型
-    print(f"[2/4] 加载 Chronos-2 模型: {args.model}（首次会从 HuggingFace 下载权重）...")
-    from chronos import Chronos2Pipeline
+    # 1) 连接数据库
+    print("[1/4] 连接达梦数据库...")
+    import dmPython
 
-    device = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
-    print(f"       使用设备: {device}")
+    conn = dmPython.connect(
+        user=args.db_user,
+        password=args.db_password,
+        server=args.db_host,
+        port=args.db_port,
+    )
+    print(f"       数据库: {args.db_host}:{args.db_port} / {args.db_user}")
 
-    pipeline = Chronos2Pipeline.from_pretrained(args.model, device_map=device)
+    try:
+        # 2) 加载模型
+        print(f"[2/4] 加载 Chronos-2 模型: {args.model}（首次会从 HuggingFace 下载权重）...")
+        from chronos import Chronos2Pipeline
 
-    # 3) 滚动预测
-    print(f"[3/4] 开始滚动预测，共 {len(split_dates)} 个日期...")
-    success_count = 0
-    fail_count = 0
+        device = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
+        print(f"       使用设备: {device}")
 
-    for split_date in split_dates:
-        ok = _run_single_forecast(
-            split_date, df, pipeline, args, output_dir,
-            use_date_suffix=(len(split_dates) > 1),
-        )
-        if ok:
-            success_count += 1
-        else:
-            fail_count += 1
+        pipeline = Chronos2Pipeline.from_pretrained(args.model, device_map=device)
 
-    # 4) 汇总
-    print(f"\n[4/4] 滚动预测完成: 成功 {success_count} 天，失败 {fail_count} 天。")
-    if success_count == 0:
-        print("[错误] 没有一天预测成功。")
-        return 1
-    print("[完成] 预测、对比与入库结束。")
-    return 0
+        # 3) 滚动预测
+        print(f"[3/4] 开始滚动预测，共 {len(split_dates)} 个日期...")
+        success_count = 0
+        fail_count = 0
+
+        for split_date in split_dates:
+            # 每次只读取本次预测所需时间窗口的数据
+            df = _load_forecast_data(conn, split_date, args)
+            if df is None or df.empty:
+                print(f"[错误] {split_date.strftime('%Y-%m-%d')} 数据加载失败，跳过。")
+                fail_count += 1
+                continue
+
+            print(
+                f"       时间范围: {df[TIMESTAMP_COLUMN].min()} ~ {df[TIMESTAMP_COLUMN].max()}"
+            )
+            print(f"       行数: {len(df)}")
+            print(f"       数据频率: 15 分钟")
+
+            ok = _run_single_forecast(
+                split_date,
+                df,
+                pipeline,
+                args,
+                output_dir,
+                use_date_suffix=(len(split_dates) > 1),
+            )
+            if ok:
+                success_count += 1
+            else:
+                fail_count += 1
+
+        # 4) 汇总
+        print(f"\n[4/4] 滚动预测完成: 成功 {success_count} 天，失败 {fail_count} 天。")
+        if success_count == 0:
+            print("[错误] 没有一天预测成功。")
+            return 1
+        print("[完成] 预测、对比与入库结束。")
+        return 0
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

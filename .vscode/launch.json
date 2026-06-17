@@ -11,7 +11,15 @@
             "args": [
                 "--skip-db",
                 "--device",
-                "cpu"
+                "cpu",
+                "--fb-date",
+                "2025-11-01",
+                "--db-id",
+                "0101350600",
+                "--db-id-nwp",
+                "0101350600",
+                "--max-context-days",
+                "50"
             ],
             "justMyCode": false
         },
@@ -25,14 +33,14 @@
             "args": [
                 "--device",
                 "cuda",
-                "--start-date",
+                "--fb-date",
                 "2025-11-01",
-                "--end-date",
-                "2025-11-30",
-                "--input",
-                "data/dm_output.xlsx",
                 "--db-id",
-                "0101350600"
+                "0101350600",
+                "--db-id-nwp",
+                "0101350600",
+                "--max-context-days",
+                "50"
             ],
             "justMyCode": false
         }
