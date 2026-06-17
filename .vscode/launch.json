@@ -1,0 +1,40 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: 15min 预测（调试，跳过数据库）",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/forecast_chronos_15min.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--skip-db",
+                "--device",
+                "cpu"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Python: 15min 预测（写入数据库）",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/forecast_chronos_15min.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--device",
+                "cuda",
+                "--start-date",
+                "2025-11-01",
+                "--end-date",
+                "2025-11-30",
+                "--input",
+                "data/dm_output.xlsx",
+                "--db-id",
+                "0101350600"
+            ],
+            "justMyCode": false
+        }
+    ]
+}
