@@ -236,20 +236,34 @@ def _load_forecast_data(
     df_radi = _read_nwp_range(conn, context_start, horizon_end, args.db_nwp_radi_meas_type, args)
     df_radi.rename(columns={"value": "RADI"}, inplace=True)
 
-    df = df_mea.merge(df_temp, on=TIMESTAMP_COLUMN, how="left")
-    df = df.merge(df_radi, on=TIMESTAMP_COLUMN, how="left")
+    # 使用 outer merge，保留 NWP 未来协变量行，即使 MEA 未来实测负荷尚未入库
+    df = df_mea.merge(df_temp, on=TIMESTAMP_COLUMN, how="outer")
+    df = df.merge(df_radi, on=TIMESTAMP_COLUMN, how="outer")
 
-    # 删除全天 RADI 值都为 0 的记录
+    # 删除历史上下文中 RADI 全天为 0 的异常日期；保留未来预测期
     df["date"] = df[TIMESTAMP_COLUMN].dt.date
     days_all_zero = df.groupby("date")["RADI"].transform(lambda x: (x == 0).all())
-    removed_days = df.loc[days_all_zero, "date"].unique()
-    df = df[~days_all_zero].copy()
+    context_mask = df[TIMESTAMP_COLUMN] < split_date
+    removed_days = df.loc[context_mask & days_all_zero, "date"].unique()
+    df = df[~(context_mask & days_all_zero)].copy()
     df.drop(columns=["date"], inplace=True)
     if len(removed_days):
         print(
-            f"       移除 {len(removed_days)} 天 RADI 全为 0 的日期: "
+            f"       移除 {len(removed_days)} 天历史 RADI 全为 0 的日期: "
             f"{sorted(str(d) for d in removed_days)}"
         )
+
+    # 补齐完整时间轴：未来 y 缺失时设为 NaN，协变量由 NWP 插值填充
+    full_start = context_start.floor(FREQ)
+    full_end = (horizon_end - pd.Timedelta(minutes=15)).floor(FREQ)
+    full_index = pd.date_range(start=full_start, end=full_end, freq=FREQ)
+
+    df = df.set_index(TIMESTAMP_COLUMN).reindex(full_index)
+    for col in COVARIATES:
+        if col in df.columns:
+            df[col] = df[col].interpolate(method="linear", limit_direction="both")
+    df[TIMESTAMP_COLUMN] = df.index
+    df = df.reset_index(drop=True)
 
     df.sort_values(TIMESTAMP_COLUMN, inplace=True)
     df.reset_index(drop=True, inplace=True)
@@ -401,7 +415,7 @@ def _run_single_forecast(
         print(f"[错误] {date_str} 之前无数据，无法构建上下文，跳过。")
         return False
     if len(horizon_df) == 0:
-        print(f"[错误] {date_str} 起未来 10 天无数据，无法评估，跳过。")
+        print(f"[错误] {date_str} 起未来 10 天无数据（含协变量），无法预测，跳过。")
         return False
 
     horizon_end_exact = split_date + pd.Timedelta(minutes=15 * (HORIZON_STEPS - 1))
